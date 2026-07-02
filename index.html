@@ -101,12 +101,12 @@ window.onerror = function(msg, src, line, col, err){
    Firebase 콘솔(console.firebase.google.com) → 프로젝트 설정 → 일반 →
    "내 앱" 섹션의 웹 앱에서 이 형태의 config 객체를 복사할 수 있습니다.
    ========================================================================= */
-const firebaseConfig = {
+ const firebaseConfig = {
   apiKey: "AIzaSyBxlAWmJLvutf6_xyJ-zA3T1FutMAIVEDo",  
   authDomain: "vernon-smith-stock-trade.firebaseapp.com",
   databaseURL: "https://vernon-smith-stock-trade-default-rtdb.asia-southeast1.firebasedatabase.app",
   projectId: "vernon-smith-stock-trade"
-};
+ };
 /* ========================================================================= */
 
 const NEEDS_SETUP = firebaseConfig.apiKey === "YOUR_API_KEY";
@@ -176,7 +176,7 @@ function rollWeightedDividend(values){
 const S = {
   role:null, name:'', safeName:'', nameInput:'', hostBlockedMsg:'',
   config:null, round:null, history:[], participantNames:[], orderCount:0,
-  myOrder:null, bidInput:'', askInput:'', busy:false, rolling:false, rollDisplay:null,
+  myOrder:null, bidInput:'', askInput:'', bidQty:'1', askQty:'1', busy:false, rolling:false, rollDisplay:null,
   confirmingReset:false, editRounds:10, editDividends: DEFAULT_DIVIDENDS.slice(),
   lastUpdated:null, refreshing:false,
   gateOk:false, gateError:'', inviteCode:null, dbStatus:'checking'
@@ -332,12 +332,23 @@ async function calcEquilibrium(){
   if(!players || !Object.keys(players).length){
     S.busy = false; S.flashError = '참가자 자산을 읽지 못했습니다. 새로고침 후 다시 시도하세요.'; render(); return;
   }
-  // 자산 검증: 매수는 현금이 호가 이상, 매도는 주식 1주 이상 보유해야 유효
+  // 주문을 1주 단위로 분해 (수량 지원). 자산 한도를 넘는 수량은 자동으로 잘라낸다.
   const bids = [], asks = [];
   Object.entries(ordersObj || {}).forEach(([name, o])=>{
     const p = players[name] || {cash:0, shares:0};
-    if(o && o.bid !== null && o.bid !== undefined && !isNaN(o.bid) && Number(o.bid) <= p.cash) bids.push({name, price:Number(o.bid)});
-    if(o && o.ask !== null && o.ask !== undefined && !isNaN(o.ask) && (p.shares||0) >= 1) asks.push({name, price:Number(o.ask)});
+    if(o && o.bid !== null && o.bid !== undefined && !isNaN(o.bid)){
+      const price = Number(o.bid);
+      const wantQty = Math.max(1, Math.floor(Number(o.bidQty)||1));
+      const affordable = price > 0 ? Math.floor(p.cash / price) : wantQty;
+      const qty = Math.min(wantQty, affordable);
+      for(let u=0; u<qty; u++) bids.push({name, price});
+    }
+    if(o && o.ask !== null && o.ask !== undefined && !isNaN(o.ask)){
+      const price = Number(o.ask);
+      const wantQty = Math.max(1, Math.floor(Number(o.askQty)||1));
+      const qty = Math.min(wantQty, p.shares||0);
+      for(let u=0; u<qty; u++) asks.push({name, price});
+    }
   });
   bids.sort((a,b)=>b.price-a.price);
   asks.sort((a,b)=>a.price-b.price);
@@ -356,16 +367,13 @@ async function calcEquilibrium(){
       seller.cash = Math.round((seller.cash + price)*100)/100;
       seller.shares = (seller.shares||0) - 1;
     }
-  } else {
-    const bb = bids[0] ? bids[0].price : null;
-    const ba = asks[0] ? asks[0].price : null;
-    if(bb!=null && ba!=null) price = Math.round((bb+ba)/2*100)/100;
-    else if(bb!=null) price = bb;
-    else if(ba!=null) price = ba;
   }
+  // 미체결 시 가격은 존재하지 않는다. 참고용 호가 스프레드만 기록.
+  const bestBid = bids[0] ? bids[0].price : null;
+  const bestAsk = asks[0] ? asks[0].price : null;
   const trades = k>0 ? Array.from({length:k}, (_,i)=>({buyer:bids[i].name, seller:asks[i].name})) : [];
   const ok = await updatePaths({
-    '/round': {...round, status:'calculated', clearingPrice:price, volume:k, trades},
+    '/round': {...round, status:'calculated', clearingPrice:price, volume:k, trades, bestBid, bestAsk},
     '/players': players
   });
   if(!ok){ S.busy = false; S.flashError = '체결 결과 저장에 실패했습니다. 새로고침 후 균형가 계산을 다시 눌러주세요.'; render(); return; }
@@ -410,7 +418,7 @@ async function finishRoll(values){
     p.cash = Math.round((p.cash + (p.shares||0) * final)*100)/100;
   });
   const updated = {...round, status:'revealed', dividendValue: final};
-  const histEntry = { round: round.round, fundamental: round.fundamentalValue, clearingPrice: round.clearingPrice ?? null, volume: round.volume ?? null, dividendValue: final };
+  const histEntry = { round: round.round, fundamental: round.fundamentalValue, clearingPrice: round.clearingPrice ?? null, volume: round.volume ?? null, bestBid: round.bestBid ?? null, bestAsk: round.bestAsk ?? null, dividendValue: final };
   let ok = await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players });
   if(!ok){ ok = await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players }); }
   if(!ok){
@@ -450,32 +458,36 @@ async function endSession(){
 }
 
 async function submitOrder(pass){
-  let bid = null, ask = null;
+  let bid = null, ask = null, bidQty = 0, askQty = 0;
   if(!pass){
     bid = S.bidInput === '' ? null : Number(S.bidInput);
     ask = S.askInput === '' ? null : Number(S.askInput);
+    bidQty = Math.max(1, Math.floor(Number(S.bidQty)||1));
+    askQty = Math.max(1, Math.floor(Number(S.askQty)||1));
     if((bid===null||isNaN(bid)) && (ask===null||isNaN(ask))) return;
-    // 보유 자산 검증
+    // 보유 자산 검증 (수량 반영)
     const p = S.myPlayer || {cash:0, shares:0};
-    if(bid!==null && !isNaN(bid) && bid > p.cash){
-      S.orderError = `현금이 부족합니다 (보유 현금 ${fmt(p.cash)}).`;
+    if(bid!==null && !isNaN(bid) && bid * bidQty > p.cash){
+      S.orderError = `현금이 부족합니다: ${fmt(bid)} × ${bidQty}주 = ${fmt(bid*bidQty)} 필요 (보유 ${fmt(p.cash)}).`;
       render(); return;
     }
-    if(ask!==null && !isNaN(ask) && (p.shares||0) < 1){
-      S.orderError = '팔 주식이 없습니다.';
+    if(ask!==null && !isNaN(ask) && askQty > (p.shares||0)){
+      S.orderError = `보유 주식이 부족합니다 (보유 ${p.shares||0}주, 매도 시도 ${askQty}주).`;
       render(); return;
     }
   }
   S.busy = true; S.orderError = ''; render();
   const ok = await setJSON(`orders/${S.round.round}/${S.safeName}`, {
     bid: (bid===null||isNaN(bid)) ? null : Math.max(0,bid),
+    bidQty: (bid===null||isNaN(bid)) ? null : bidQty,
     ask: (ask===null||isNaN(ask)) ? null : Math.max(0,ask),
+    askQty: (ask===null||isNaN(ask)) ? null : askQty,
     pass: !!pass,
     submittedAt: Date.now()
   });
   S.busy = false;
   if(!ok){ S.orderError = '서버 저장 실패 — 새로고침 후 다시 시도하세요.'; render(); return; }
-  S.bidInput=''; S.askInput='';
+  S.bidInput=''; S.askInput=''; S.bidQty='1'; S.askQty='1';
   await loadAll();
 }
 
@@ -502,16 +514,16 @@ function updateChart(){
   if(!el || typeof Chart === 'undefined') return;
   if(chart){ chart.destroy(); chart = null; }
   const labels = S.history.map(h=>`R${h.round}`);
-  const priceData = S.history.map(h=>h.clearingPrice);
+  const priceData = S.history.map(h=> (h.volume>0 && h.clearingPrice!=null) ? h.clearingPrice : null);
   if(S.round && S.round.status !== 'collecting' && (S.history.length===0 || S.history[S.history.length-1].round !== S.round.round)){
     labels.push(`R${S.round.round}`);
-    priceData.push(S.round.status==='collecting' ? null : S.round.clearingPrice);
+    priceData.push((S.round.volume>0 && S.round.clearingPrice!=null) ? S.round.clearingPrice : null);
   }
   // 게임 중에는 체결가(시장가격)만 노출한다. 펀더멘털은 종료 후 최종 분석에서만 공개.
   chart = new Chart(el.getContext('2d'), {
     type:'line',
     data:{ labels, datasets:[
-      { label:'시장 체결가', data: priceData, borderColor:'#5CC79A', backgroundColor:'rgba(92,199,154,0.08)', pointRadius:4, tension:0.15, fill:true }
+      { label:'시장 체결가', data: priceData, borderColor:'#5CC79A', backgroundColor:'rgba(92,199,154,0.08)', pointRadius:4, tension:0.15, fill:true, spanGaps:true }
     ]},
     options:{
       responsive:true, animation:{duration:300},
@@ -533,7 +545,7 @@ function computeFinalStats(){
   }
   const totalDividends = cum; // 1라운드 시점의 실제가치 = 전체 실제 배당 합
   const hits = hist.filter(h=>(h.dividendValue||0)>0).length;
-  const deviations = hist.map(h=> (h.clearingPrice!=null) ? Math.round((h.clearingPrice - h.fundamental)*100)/100 : null);
+  const deviations = hist.map(h=> (h.volume>0 && h.clearingPrice!=null) ? Math.round((h.clearingPrice - h.fundamental)*100)/100 : null);
   const validDev = deviations.filter(d=>d!=null);
   const avgDev = validDev.length ? Math.round(validDev.reduce((a,b)=>a+b,0)/validDev.length*100)/100 : null;
   let maxDev = null, maxDevRound = null;
@@ -586,7 +598,7 @@ function updateFinalCharts(){
       data:{ labels, datasets:[
         { label:'사전 기대가치', data: S.history.map(h=>h.fundamental), borderColor:'#D9CB93', backgroundColor:'transparent', borderDash:[5,4], pointRadius:2, tension:0 },
         { label:'사후 실제가치', data: st.actualValue, borderColor:'#EDEAE0', backgroundColor:'transparent', pointRadius:3, tension:0, borderWidth:2 },
-        { label:'체결가', data: S.history.map(h=>h.clearingPrice), borderColor:'#5CC79A', backgroundColor:'rgba(92,199,154,0.08)', pointRadius:3, tension:0.15, fill:true }
+        { label:'체결가', data: S.history.map(h=>(h.volume>0 && h.clearingPrice!=null)?h.clearingPrice:null), borderColor:'#5CC79A', backgroundColor:'rgba(92,199,154,0.08)', pointRadius:3, tension:0.15, fill:true, spanGaps:true }
       ]},
       options:{
         responsive:true, animation:{duration:400},
@@ -748,6 +760,12 @@ function statusBadge(){
   const label = st==='lobby' ? '대기 중' : st==='active' ? '진행 중' : '종료됨';
   return `<span class="badge"><span class="dot ${st==='active'?'live':''}"></span>${label}</span>`;
 }
+function priceDisplay(r){
+  if(r && r.volume > 0 && r.clearingPrice != null) return `<span class="mono tag-bid">${fmt(r.clearingPrice)}</span>`;
+  const bb = r && r.bestBid != null ? fmt(r.bestBid) : '—';
+  const ba = r && r.bestAsk != null ? fmt(r.bestAsk) : '—';
+  return `<span class="mono" style="color:var(--ink-dim);">체결 없음</span> <span class="small mono">(매수최고 ${bb} / 매도최저 ${ba})</span>`;
+}
 function dbChip(){
   if(S.dbStatus === 'ok') return `<span class="badge" style="color:var(--bid);">DB ✓</span>`;
   if(S.dbStatus === 'readonly') return `<span class="badge" style="color:var(--danger);">DB 쓰기거부</span>`;
@@ -760,7 +778,7 @@ function renderTicker(){
   return `
     <div class="ticker">
       <div class="status-line">${statusBadge()}${dbChip()}<span class="mono">${c && c.status!=='lobby' ? `라운드 ${r?r.round:c.currentRound} / ${c.totalRounds}` : '세션 준비 중'}</span></div>
-      <div class="status-line mono">${(()=>{ const c2=S.config; if(c2 && c2.status==='ended' && r) return `펀더멘털 <span class="tag-fund">${fmt(r.fundamentalValue)}</span>`; const last = S.history.length ? S.history[S.history.length-1] : null; return last && last.clearingPrice!=null ? `직전 체결가 <span class="tag-bid">${fmt(last.clearingPrice)}</span>` : ''; })()}</div>
+      <div class="status-line mono">${(()=>{ const c2=S.config; if(c2 && c2.status==='ended' && r) return `펀더멘털 <span class="tag-fund">${fmt(r.fundamentalValue)}</span>`; for(let i=S.history.length-1;i>=0;i--){ const h=S.history[i]; if(h.volume>0 && h.clearingPrice!=null) return `직전 체결가 <span class="tag-bid">${fmt(h.clearingPrice)}</span> <span class="small">(R${h.round})</span>`; } return ''; })()}</div>
       <div class="row" style="gap:10px;">
         <span class="small mono">확인 시각 ${updated}</span>
         <button class="ghost" id="refreshBtn" ${S.refreshing?'disabled':''}>${S.refreshing?'새로고침 중…':'⟳ 새로고침'}</button>
@@ -780,8 +798,8 @@ function renderHistoryTable(showFund){
           <tr>
             <td class="mono">${h.round}</td>
             ${showFund?`<td class="mono tag-fund">${fmt(h.fundamental)}</td>`:''}
-            <td class="mono tag-bid">${fmt(h.clearingPrice)}</td>
-            <td class="mono">${h.volume ?? '—'}</td>
+            <td class="mono">${h.volume>0 ? `<span class="tag-bid">${fmt(h.clearingPrice)}</span>` : `<span style="color:var(--ink-faint);">체결 없음</span>`}</td>
+            <td class="mono">${h.volume ?? 0}</td>
             <td class="mono">${hit ? `<span class="tag-bid">✓ 성공 (+${fmt(h.dividendValue)})</span>` : `<span style="color:var(--danger)">✗ 실패 (0)</span>`}</td>
           </tr>`;}).join('')}
       </tbody>
@@ -887,7 +905,7 @@ function renderHost(){
       controls = `
         <div class="panel">
           <div class="row between" style="margin-bottom:14px;">
-            <div><div class="small">균형 체결가</div><div class="mono tag-bid" style="font-size:24px;">${fmt(r.clearingPrice)}</div><div class="small">거래량 ${r.volume ?? 0}건</div></div>
+            <div><div class="small">이번 라운드 결과</div><div style="font-size:${r.volume>0?'24px':'16px'};">${priceDisplay(r)}</div><div class="small">체결 ${r.volume ?? 0}주</div></div>
             <button class="primary" id="rollBtn" ${S.rolling?'disabled':''}>${S.rolling?'추첨 중...':'배당 추첨'}</button>
           </div>
           ${S.rolling ? `<div class="dice-box">${S.rollDisplay ?? '?'}</div>` : ''}
@@ -897,7 +915,7 @@ function renderHost(){
       controls = `
         <div class="panel">
           <div class="grid2" style="margin-bottom:14px;">
-            <div><div class="small">체결가</div><div class="mono tag-bid" style="font-size:20px;">${fmt(r.clearingPrice)}</div></div>
+            <div><div class="small">이번 라운드 결과</div><div style="font-size:${r.volume>0?'20px':'15px'};">${priceDisplay(r)}</div></div>
             <div><div class="small">이번 배당</div><div class="mono" style="font-size:20px;">${fmt(r.dividendValue)}</div></div>
           </div>
           <button class="primary" id="${isLast?'endBtn':'nextBtn'}">${isLast?'세션 종료':'다음 라운드'}</button>
@@ -972,8 +990,8 @@ function renderParticipant(){
           <div class="panel">
             <p class="muted">${S.myOrder.pass ? '이번 라운드는 관망하기로 했습니다.' : '제출 완료.'} 다른 참가자를 기다리는 중입니다.</p>
             ${S.myOrder.pass ? '' : `<div class="grid2" style="margin-top:10px;">
-              <div><div class="small">내 매수 희망가</div><div class="mono tag-bid">${S.myOrder.bid!=null?fmt(S.myOrder.bid):'—'}</div></div>
-              <div><div class="small">내 매도 희망가</div><div class="mono tag-ask">${S.myOrder.ask!=null?fmt(S.myOrder.ask):'—'}</div></div>
+              <div><div class="small">내 매수 주문</div><div class="mono tag-bid">${S.myOrder.bid!=null?`${fmt(S.myOrder.bid)} × ${S.myOrder.bidQty||1}주`:'—'}</div></div>
+              <div><div class="small">내 매도 주문</div><div class="mono tag-ask">${S.myOrder.ask!=null?`${fmt(S.myOrder.ask)} × ${S.myOrder.askQty||1}주`:'—'}</div></div>
             </div>`}
           </div>`;
       } else {
@@ -983,8 +1001,18 @@ function renderParticipant(){
             <h3 style="font-size:16px; margin-bottom:4px;">이번 라운드 주문 (1주 단위)</h3>
             <p class="small" style="margin-bottom:14px;">사고 싶으면 매수가만, 팔고 싶으면 매도가만 입력하세요. 거래하지 않으려면 관망을 누르세요.</p>
             <div class="grid2">
-              <div><label for="bidField" class="tag-bid">매수 희망가 (보유 현금 ${fmt(my.cash)} 이내)</label><input id="bidField" class="mono" type="number" min="0" placeholder="예: 9" value="${S.bidInput!==''?S.bidInput:''}" /></div>
-              <div><label for="askField" class="tag-ask">매도 희망가 ${canSell?'':'(보유 주식 없음)'}</label><input id="askField" class="mono" type="number" min="0" placeholder="예: 11" value="${S.askInput!==''?S.askInput:''}" ${canSell?'':'disabled'} /></div>
+              <div>
+                <label for="bidField" class="tag-bid">매수 희망가 (1주당)</label>
+                <input id="bidField" class="mono" type="number" min="0" placeholder="예: 9" value="${S.bidInput!==''?S.bidInput:''}" />
+                <label for="bidQtyField" style="margin-top:8px;">매수 수량 (총 ${fmt(my.cash)} 이내)</label>
+                <input id="bidQtyField" class="mono" type="number" min="1" step="1" value="${S.bidQty}" />
+              </div>
+              <div>
+                <label for="askField" class="tag-ask">매도 희망가 (1주당) ${canSell?'':'— 보유 주식 없음'}</label>
+                <input id="askField" class="mono" type="number" min="0" placeholder="예: 11" value="${S.askInput!==''?S.askInput:''}" ${canSell?'':'disabled'} />
+                <label for="askQtyField" style="margin-top:8px;">매도 수량 (보유 ${my.shares||0}주)</label>
+                <input id="askQtyField" class="mono" type="number" min="1" step="1" max="${my.shares||0}" value="${S.askQty}" ${canSell?'':'disabled'} />
+              </div>
             </div>
             ${S.orderError ? `<p class="small" style="color:var(--danger); margin-top:10px;">${S.orderError}</p>` : ''}
             <div class="row" style="margin-top:14px;">
@@ -994,12 +1022,12 @@ function renderParticipant(){
           </div>`;
       }
     } else if(r.status === 'calculated'){
-      body = `<div class="panel"><div class="small">균형 체결가</div><div class="mono tag-bid" style="font-size:24px;">${fmt(r.clearingPrice)}</div><p class="muted" style="margin-top:8px;">호스트가 배당을 추첨하는 중입니다...</p></div>`;
+      body = `<div class="panel"><div class="small">이번 라운드 결과</div><div style="font-size:${r.volume>0?'24px':'16px'};">${priceDisplay(r)}</div><p class="muted" style="margin-top:8px;">호스트가 배당을 추첨하는 중입니다...</p></div>`;
     } else if(r.status === 'revealed'){
       body = `
         <div class="panel">
           <div class="grid2">
-            <div><div class="small">체결가</div><div class="mono tag-bid" style="font-size:20px;">${fmt(r.clearingPrice)}</div></div>
+            <div><div class="small">이번 라운드 결과</div><div style="font-size:${r.volume>0?'20px':'15px'};">${priceDisplay(r)}</div></div>
             <div><div class="small">이번 배당</div><div class="mono" style="font-size:20px;">${fmt(r.dividendValue)}</div></div>
           </div>
           <p class="muted" style="margin-top:10px;">호스트가 다음 라운드를 시작하면 자동으로 넘어갑니다.</p>
@@ -1028,6 +1056,10 @@ function attachParticipantEvents(){
   const askField = document.getElementById('askField');
   if(bidField) bidField.oninput = (e)=>{ S.bidInput = e.target.value; };
   if(askField) askField.oninput = (e)=>{ S.askInput = e.target.value; };
+  const bidQtyField = document.getElementById('bidQtyField');
+  const askQtyField = document.getElementById('askQtyField');
+  if(bidQtyField) bidQtyField.oninput = (e)=>{ S.bidQty = e.target.value; };
+  if(askQtyField) askQtyField.oninput = (e)=>{ S.askQty = e.target.value; };
   const submitBtn = document.getElementById('submitBtn');
   if(submitBtn) submitBtn.onclick = ()=>submitOrder(false);
   const passBtn = document.getElementById('passBtn');
