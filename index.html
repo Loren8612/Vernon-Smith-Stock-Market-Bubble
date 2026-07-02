@@ -102,10 +102,10 @@ window.onerror = function(msg, src, line, col, err){
    "내 앱" 섹션의 웹 앱에서 이 형태의 config 객체를 복사할 수 있습니다.
    ========================================================================= */
 const firebaseConfig = {
-  apiKey: "AIzaSyBxlAWmJLvutf6_xyJ-zA3T1FutMAIVEDo",
-  authDomain: "vernon-smith-stock-trade.firebaseapp.com",
-  databaseURL: "https://vernon-smith-stock-trade-default-rtdb.asia-southeast1.firebasedatabase.app",
-  projectId: "vernon-smith-stock-trade"
+        apiKey: "AIzaSyBxlAWmJLvutf6_xyJ-zA3T1FutMAIVEDo",  
+        authDomain: "vernon-smith-stock-trade.firebaseapp.com",
+        databaseURL: "https://vernon-smith-stock-trade-default-rtdb.asia-southeast1.firebasedatabase.app",
+        projectId: "vernon-smith-stock-trade"
 };
 /* ========================================================================= */
 
@@ -198,6 +198,8 @@ async function loadAll(){
 
   const participantsObj = await getJSON('participants', {});
   S.participantNames = Object.keys(participantsObj || {});
+  S.players = await getJSON('players', {});
+  S.myPlayer = (S.safeName && S.players) ? (S.players[S.safeName] || null) : null;
 
   if(S.role === 'host'){
     if(round && round.status === 'collecting'){
@@ -261,6 +263,13 @@ async function joinAsParticipant(){
   const safe = sanitizeName(S.nameInput);
   if(!safe) return;
   S.busy = true; S.joinError = ''; render();
+  const cfg = await getJSON('config', null);
+  if(cfg && cfg.status === 'active'){
+    S.busy = false;
+    S.joinError = '세션이 이미 진행 중입니다. 진행자가 세션을 초기화한 후 입장할 수 있습니다.';
+    render();
+    return;
+  }
   const ok = await setJSON(`participants/${safe}`, {joinedAt: Date.now()});
   if(!ok){
     S.busy = false;
@@ -273,14 +282,37 @@ async function joinAsParticipant(){
   await loadAll();
 }
 
+// 초기 자산 배분: 총자산 100 = 현금 + (주식 × 초기가격). 극단적 불균형으로 거래를 강제한다.
+function allocateHoldings(names, price){
+  const maxShares = Math.max(1, Math.floor(100 / price)); // 기본 설정에서 10주
+  const shuffled = names.slice().sort(()=>Math.random()-0.5);
+  const res = {};
+  shuffled.forEach((n, i)=>{
+    let shares;
+    if(i % 2 === 0){
+      // 주식 몰빵형: 8~10주 (현금 0~20)
+      shares = maxShares - Math.floor(Math.random()*3);
+    } else {
+      // 현금 몰빵형: 0~2주 (현금 80~100)
+      shares = Math.floor(Math.random()*3);
+    }
+    shares = Math.max(0, Math.min(maxShares, shares));
+    const cash = Math.round((100 - shares * price) * 100) / 100;
+    res[n] = { cash, shares };
+  });
+  return res;
+}
+
 async function startSession(){
   S.busy = true; render();
   const totalRounds = Math.max(1, Math.min(60, Number(S.editRounds)||10));
   const dividendValues = S.editDividends.map(v=>Math.max(0, Number(v)||0));
   const expDiv = expectedDividend(dividendValues);
-  const config = { status:'active', totalRounds, dividendValues, currentRound:1, hostClaimed:true };
-  const round = { round:1, status:'collecting', fundamentalValue: computeFundamental(1, totalRounds, expDiv), clearingPrice:null, volume:null, dividendValue:null };
-  await updatePaths({ '/config': config, '/round': round, '/history': null, '/orders': null });
+  const startPrice = computeFundamental(1, totalRounds, expDiv);
+  const players = allocateHoldings(S.participantNames, startPrice);
+  const config = { status:'active', totalRounds, dividendValues, currentRound:1, hostClaimed:true, startPrice };
+  const round = { round:1, status:'collecting', fundamentalValue: startPrice, clearingPrice:null, volume:null, dividendValue:null };
+  await updatePaths({ '/config': config, '/round': round, '/history': null, '/orders': null, '/players': players });
   S.busy = false;
   await loadAll();
 }
@@ -289,13 +321,43 @@ async function calcEquilibrium(){
   S.busy = true; render();
   const round = S.round;
   const ordersObj = await getJSON(`orders/${round.round}`, {});
+  const players = await getJSON('players', {});
+  // 자산 검증: 매수는 현금이 호가 이상, 매도는 주식 1주 이상 보유해야 유효
   const bids = [], asks = [];
-  Object.values(ordersObj || {}).forEach(v=>{
-    if(v.bid !== null && v.bid !== undefined && !isNaN(v.bid)) bids.push(Number(v.bid));
-    if(v.ask !== null && v.ask !== undefined && !isNaN(v.ask)) asks.push(Number(v.ask));
+  Object.entries(ordersObj || {}).forEach(([name, o])=>{
+    const p = players[name] || {cash:0, shares:0};
+    if(o && o.bid !== null && o.bid !== undefined && !isNaN(o.bid) && Number(o.bid) <= p.cash) bids.push({name, price:Number(o.bid)});
+    if(o && o.ask !== null && o.ask !== undefined && !isNaN(o.ask) && (p.shares||0) >= 1) asks.push({name, price:Number(o.ask)});
   });
-  const {price, volume} = computeEquilibrium(bids, asks);
-  await setJSON('round', {...round, status:'calculated', clearingPrice:price, volume});
+  bids.sort((a,b)=>b.price-a.price);
+  asks.sort((a,b)=>a.price-b.price);
+  const n = Math.min(bids.length, asks.length);
+  let k = 0;
+  for(let i=0;i<n;i++){ if(bids[i].price >= asks[i].price) k = i+1; else break; }
+  let price = null;
+  if(k > 0){
+    price = Math.round((bids[k-1].price + asks[k-1].price)/2 * 100)/100;
+    // 실제 체결: 상위 k 매수자와 하위 k 매도자 간 1주씩, 균형가로 현금·주식 이동
+    for(let i=0;i<k;i++){
+      const buyer = players[bids[i].name];
+      const seller = players[asks[i].name];
+      buyer.cash = Math.round((buyer.cash - price)*100)/100;
+      buyer.shares = (buyer.shares||0) + 1;
+      seller.cash = Math.round((seller.cash + price)*100)/100;
+      seller.shares = (seller.shares||0) - 1;
+    }
+  } else {
+    const bb = bids[0] ? bids[0].price : null;
+    const ba = asks[0] ? asks[0].price : null;
+    if(bb!=null && ba!=null) price = Math.round((bb+ba)/2*100)/100;
+    else if(bb!=null) price = bb;
+    else if(ba!=null) price = ba;
+  }
+  const trades = k>0 ? Array.from({length:k}, (_,i)=>({buyer:bids[i].name, seller:asks[i].name})) : [];
+  await updatePaths({
+    '/round': {...round, status:'calculated', clearingPrice:price, volume:k, trades},
+    '/players': players
+  });
   S.busy = false;
   await loadAll();
 }
@@ -315,9 +377,14 @@ async function finishRoll(values){
   const final = rollWeightedDividend(values);
   S.rollDisplay = final; render();
   const round = S.round;
+  // 배당 지급: 보유 주식 1주당 배당액만큼 현금 증가
+  const players = await getJSON('players', {});
+  Object.values(players || {}).forEach(p=>{
+    p.cash = Math.round((p.cash + (p.shares||0) * final)*100)/100;
+  });
   const updated = {...round, status:'revealed', dividendValue: final};
   const histEntry = { round: round.round, fundamental: round.fundamentalValue, clearingPrice: round.clearingPrice, volume: round.volume, dividendValue: final };
-  await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry });
+  await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players });
   S.rolling = false;
   await loadAll();
 }
@@ -340,23 +407,39 @@ async function endSession(){
   await loadAll();
 }
 
-async function submitOrder(){
-  const bid = S.bidInput === '' ? null : Number(S.bidInput);
-  const ask = S.askInput === '' ? null : Number(S.askInput);
-  if((bid===null||isNaN(bid)) && (ask===null||isNaN(ask))) return;
-  S.busy = true; render();
-  await setJSON(`orders/${S.round.round}/${S.safeName}`, {
+async function submitOrder(pass){
+  let bid = null, ask = null;
+  if(!pass){
+    bid = S.bidInput === '' ? null : Number(S.bidInput);
+    ask = S.askInput === '' ? null : Number(S.askInput);
+    if((bid===null||isNaN(bid)) && (ask===null||isNaN(ask))) return;
+    // 보유 자산 검증
+    const p = S.myPlayer || {cash:0, shares:0};
+    if(bid!==null && !isNaN(bid) && bid > p.cash){
+      S.orderError = `현금이 부족합니다 (보유 현금 ${fmt(p.cash)}).`;
+      render(); return;
+    }
+    if(ask!==null && !isNaN(ask) && (p.shares||0) < 1){
+      S.orderError = '팔 주식이 없습니다.';
+      render(); return;
+    }
+  }
+  S.busy = true; S.orderError = ''; render();
+  const ok = await setJSON(`orders/${S.round.round}/${S.safeName}`, {
     bid: (bid===null||isNaN(bid)) ? null : Math.max(0,bid),
     ask: (ask===null||isNaN(ask)) ? null : Math.max(0,ask),
+    pass: !!pass,
     submittedAt: Date.now()
   });
-  S.busy = false; S.bidInput=''; S.askInput='';
+  S.busy = false;
+  if(!ok){ S.orderError = '서버 저장 실패 — 새로고침 후 다시 시도하세요.'; render(); return; }
+  S.bidInput=''; S.askInput='';
   await loadAll();
 }
 
 async function resetSession(){
   S.busy = true; render();
-  await updatePaths({ '/config': null, '/round': null, '/history': null, '/participants': null, '/orders': null });
+  await updatePaths({ '/config': null, '/round': null, '/history': null, '/participants': null, '/orders': null, '/players': null });
   S.confirmingReset = false; S.busy = false;
   S.editRounds = 10; S.editDividends = DEFAULT_DIVIDENDS.slice();
   await loadAll();
@@ -376,18 +459,16 @@ function updateChart(){
   if(!el || typeof Chart === 'undefined') return;
   if(chart){ chart.destroy(); chart = null; }
   const labels = S.history.map(h=>`R${h.round}`);
-  const fundData = S.history.map(h=>h.fundamental);
   const priceData = S.history.map(h=>h.clearingPrice);
   if(S.round && S.round.status !== 'collecting' && (S.history.length===0 || S.history[S.history.length-1].round !== S.round.round)){
     labels.push(`R${S.round.round}`);
-    fundData.push(S.round.fundamentalValue);
     priceData.push(S.round.status==='collecting' ? null : S.round.clearingPrice);
   }
+  // 게임 중에는 체결가(시장가격)만 노출한다. 펀더멘털은 종료 후 최종 분석에서만 공개.
   chart = new Chart(el.getContext('2d'), {
     type:'line',
     data:{ labels, datasets:[
-      { label:'펀더멘털 가치', data: fundData, borderColor:'#D9CB93', backgroundColor:'transparent', borderDash:[5,4], pointRadius:2, tension:0 },
-      { label:'체결가', data: priceData, borderColor:'#5CC79A', backgroundColor:'rgba(92,199,154,0.08)', pointRadius:3, tension:0.15, fill:true }
+      { label:'시장 체결가', data: priceData, borderColor:'#5CC79A', backgroundColor:'rgba(92,199,154,0.08)', pointRadius:4, tension:0.15, fill:true }
     ]},
     options:{
       responsive:true, animation:{duration:300},
@@ -424,6 +505,7 @@ function renderFinalAnalysis(){
   const st = computeFinalStats();
   const initialFund = S.history[0].fundamental;
   return `
+    ${renderLeaderboard()}
     <div class="panel">
       <h3 style="font-size:15px; margin-bottom:8px;">최종 요약</h3>
       <div class="grid2">
@@ -444,7 +526,7 @@ function renderFinalAnalysis(){
       <p class="small" style="margin-bottom:12px;">0보다 위면 과대평가(버블 방향), 아래면 과소평가입니다.</p>
       <canvas id="devChart" height="150"></canvas>
     </div>
-    <div class="panel"><h3 style="font-size:15px; margin-bottom:10px;">전체 라운드 기록</h3>${renderHistoryTable()}</div>
+    <div class="panel"><h3 style="font-size:15px; margin-bottom:10px;">전체 라운드 기록</h3>${renderHistoryTable(true)}</div>
   `;
 }
 
@@ -635,7 +717,7 @@ function renderTicker(){
   return `
     <div class="ticker">
       <div class="status-line">${statusBadge()}${dbChip()}<span class="mono">${c && c.status!=='lobby' ? `라운드 ${r?r.round:c.currentRound} / ${c.totalRounds}` : '세션 준비 중'}</span></div>
-      <div class="status-line mono">${r ? `펀더멘털 가치 <span class="tag-fund">${fmt(r.fundamentalValue)}</span>` : ''}</div>
+      <div class="status-line mono">${(()=>{ const c2=S.config; if(c2 && c2.status==='ended' && r) return `펀더멘털 <span class="tag-fund">${fmt(r.fundamentalValue)}</span>`; const last = S.history.length ? S.history[S.history.length-1] : null; return last && last.clearingPrice!=null ? `직전 체결가 <span class="tag-bid">${fmt(last.clearingPrice)}</span>` : ''; })()}</div>
       <div class="row" style="gap:10px;">
         <span class="small mono">확인 시각 ${updated}</span>
         <button class="ghost" id="refreshBtn" ${S.refreshing?'disabled':''}>${S.refreshing?'새로고침 중…':'⟳ 새로고침'}</button>
@@ -643,18 +725,18 @@ function renderTicker(){
     </div>
   `;
 }
-function renderHistoryTable(){
+function renderHistoryTable(showFund){
   if(!S.history.length) return `<p class="small">아직 완료된 라운드가 없습니다.</p>`;
   return `
     <table>
-      <thead><tr><th>라운드</th><th>펀더멘털</th><th>체결가</th><th>거래량</th><th>배당 결과</th></tr></thead>
+      <thead><tr><th>라운드</th>${showFund?'<th>펀더멘털</th>':''}<th>체결가</th><th>거래량</th><th>배당 결과</th></tr></thead>
       <tbody>
         ${S.history.map(h=>{
           const hit = (h.dividendValue||0) > 0;
           return `
           <tr>
             <td class="mono">${h.round}</td>
-            <td class="mono tag-fund">${fmt(h.fundamental)}</td>
+            ${showFund?`<td class="mono tag-fund">${fmt(h.fundamental)}</td>`:''}
             <td class="mono tag-bid">${fmt(h.clearingPrice)}</td>
             <td class="mono">${h.volume ?? '—'}</td>
             <td class="mono">${hit ? `<span class="tag-bid">✓ 성공 (+${fmt(h.dividendValue)})</span>` : `<span style="color:var(--danger)">✗ 실패 (0)</span>`}</td>
@@ -675,8 +757,46 @@ function renderParticipantsPanel(){
     </div>
   `;
 }
+function renderHoldingsTable(){
+  const entries = Object.entries(S.players || {});
+  if(!entries.length) return '';
+  return `
+    <div class="panel">
+      <h3 style="font-size:15px; margin-bottom:10px;">참가자 보유 현황 (진행자만 보임)</h3>
+      <table>
+        <thead><tr><th>이름</th><th>현금</th><th>주식</th></tr></thead>
+        <tbody>
+          ${entries.map(([n,p])=>`<tr><td>${n}</td><td class="mono tag-bid">${fmt(p.cash)}</td><td class="mono tag-fund">${p.shares||0}주</td></tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+function renderLeaderboard(){
+  const entries = Object.entries(S.players || {});
+  if(!entries.length) return '';
+  const ranked = entries.map(([n,p])=>({name:n, cash:p.cash, shares:p.shares||0, final: Math.round((p.cash)*100)/100}))
+    .sort((a,b)=>b.final-a.final);
+  return `
+    <div class="panel">
+      <h3 style="font-size:15px; margin-bottom:4px;">최종 순위</h3>
+      <p class="small" style="margin-bottom:12px;">게임 종료 시점에 주식의 가치는 0이므로, 최종 자산 = 남은 현금입니다. 시작 자산은 모두 100이었습니다.</p>
+      <table>
+        <thead><tr><th>순위</th><th>이름</th><th>최종 자산</th><th>수익</th><th>잔여 주식</th></tr></thead>
+        <tbody>
+          ${ranked.map((p,i)=>{
+            const profit = Math.round((p.final-100)*100)/100;
+            return `<tr>
+              <td class="mono">${i+1}</td><td>${p.name}</td>
+              <td class="mono tag-bid">${fmt(p.final)}</td>
+              <td class="mono" style="color:${profit>=0?'var(--bid)':'var(--danger)'};">${profit>0?'+':''}${fmt(profit)}</td>
+              <td class="mono">${p.shares}주 (가치 0)</td>
+            </tr>`;}).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
 function renderChartBlock(){
-  return `<div class="panel"><h3 style="font-size:15px; margin-bottom:12px;">펀더멘털 가치 vs 체결가</h3><canvas id="priceChart" height="160"></canvas></div>`;
+  return `<div class="panel"><h3 style="font-size:15px; margin-bottom:12px;">시장 가격 추이</h3><canvas id="priceChart" height="160"></canvas></div>`;
 }
 
 function renderHost(){
@@ -740,7 +860,7 @@ function renderHost(){
           <button class="primary" id="${isLast?'endBtn':'nextBtn'}">${isLast?'세션 종료':'다음 라운드'}</button>
         </div>`;
     }
-    body = `${controls}${renderChartBlock()}<div class="panel"><h3 style="font-size:15px; margin-bottom:10px;">라운드 기록</h3>${renderHistoryTable()}</div>`;
+    body = `${controls}${renderHoldingsTable()}${renderChartBlock()}<div class="panel"><h3 style="font-size:15px; margin-bottom:10px;">라운드 기록</h3>${renderHistoryTable(false)}</div>`;
   } else if(c.status === 'ended'){
     body = `
       <div class="panel"><h3 style="font-size:18px;">세션이 종료되었습니다</h3><p class="muted" style="font-size:13px;">아래 최종 분석으로 펀더멘털·실제가치·체결가의 차이를 참가자들과 함께 복기해보세요.</p></div>
@@ -795,25 +915,38 @@ function renderParticipant(){
     body = `<div class="panel"><p class="muted">호스트가 세션을 준비하고 있습니다. 곧 시작됩니다.</p></div>`;
   } else if(c.status === 'active' && r){
     if(r.status === 'collecting'){
+      const my = S.myPlayer || {cash:0, shares:0};
+      const holdings = `
+        <div class="panel panel-tight">
+          <div class="grid2">
+            <div><div class="small">내 현금</div><div class="mono tag-bid" style="font-size:20px;">${fmt(my.cash)}</div></div>
+            <div><div class="small">내 주식</div><div class="mono tag-fund" style="font-size:20px;">${my.shares||0}주</div></div>
+          </div>
+        </div>`;
       if(S.myOrder){
-        body = `
+        body = holdings + `
           <div class="panel">
-            <p class="muted">제출 완료. 다른 참가자를 기다리는 중입니다.</p>
-            <div class="grid2" style="margin-top:10px;">
+            <p class="muted">${S.myOrder.pass ? '이번 라운드는 관망하기로 했습니다.' : '제출 완료.'} 다른 참가자를 기다리는 중입니다.</p>
+            ${S.myOrder.pass ? '' : `<div class="grid2" style="margin-top:10px;">
               <div><div class="small">내 매수 희망가</div><div class="mono tag-bid">${S.myOrder.bid!=null?fmt(S.myOrder.bid):'—'}</div></div>
               <div><div class="small">내 매도 희망가</div><div class="mono tag-ask">${S.myOrder.ask!=null?fmt(S.myOrder.ask):'—'}</div></div>
-            </div>
+            </div>`}
           </div>`;
       } else {
-        body = `
+        const canSell = (my.shares||0) >= 1;
+        body = holdings + `
           <div class="panel">
-            <h3 style="font-size:16px; margin-bottom:4px;">이번 라운드 희망가 제출</h3>
-            <p class="small" style="margin-bottom:14px;">둘 다 채우지 않아도 됩니다. 사고 싶으면 매수가만, 팔고 싶으면 매도가만 입력하세요.</p>
+            <h3 style="font-size:16px; margin-bottom:4px;">이번 라운드 주문 (1주 단위)</h3>
+            <p class="small" style="margin-bottom:14px;">사고 싶으면 매수가만, 팔고 싶으면 매도가만 입력하세요. 거래하지 않으려면 관망을 누르세요.</p>
             <div class="grid2">
-              <div><label for="bidField" class="tag-bid">매수 희망가 (사고 싶은 가격)</label><input id="bidField" class="mono" type="number" min="0" placeholder="예: 22" value="${S.bidInput!==''?S.bidInput:''}" /></div>
-              <div><label for="askField" class="tag-ask">매도 희망가 (팔고 싶은 가격)</label><input id="askField" class="mono" type="number" min="0" placeholder="예: 26" value="${S.askInput!==''?S.askInput:''}" /></div>
+              <div><label for="bidField" class="tag-bid">매수 희망가 (보유 현금 ${fmt(my.cash)} 이내)</label><input id="bidField" class="mono" type="number" min="0" placeholder="예: 9" value="${S.bidInput!==''?S.bidInput:''}" /></div>
+              <div><label for="askField" class="tag-ask">매도 희망가 ${canSell?'':'(보유 주식 없음)'}</label><input id="askField" class="mono" type="number" min="0" placeholder="예: 11" value="${S.askInput!==''?S.askInput:''}" ${canSell?'':'disabled'} /></div>
             </div>
-            <button class="primary" id="submitBtn" style="margin-top:14px;" ${S.busy?'disabled':''}>제출하기</button>
+            ${S.orderError ? `<p class="small" style="color:var(--danger); margin-top:10px;">${S.orderError}</p>` : ''}
+            <div class="row" style="margin-top:14px;">
+              <button class="primary" id="submitBtn" ${S.busy?'disabled':''}>제출하기</button>
+              <button class="ghost" id="passBtn" ${S.busy?'disabled':''}>이번 라운드 관망</button>
+            </div>
           </div>`;
       }
     } else if(r.status === 'calculated'){
@@ -852,7 +985,9 @@ function attachParticipantEvents(){
   if(bidField) bidField.oninput = (e)=>{ S.bidInput = e.target.value; };
   if(askField) askField.oninput = (e)=>{ S.askInput = e.target.value; };
   const submitBtn = document.getElementById('submitBtn');
-  if(submitBtn) submitBtn.onclick = submitOrder;
+  if(submitBtn) submitBtn.onclick = ()=>submitOrder(false);
+  const passBtn = document.getElementById('passBtn');
+  if(passBtn) passBtn.onclick = ()=>submitOrder(true);
 }
 async function init(){
   if(NEEDS_SETUP){ render(); return; }
