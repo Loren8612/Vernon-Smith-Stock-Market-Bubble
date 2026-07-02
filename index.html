@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>자산시장 실험실</title>
+<title>버넌 스미스의 자산시장 실험실</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -101,27 +101,12 @@ window.onerror = function(msg, src, line, col, err){
    Firebase 콘솔(console.firebase.google.com) → 프로젝트 설정 → 일반 →
    "내 앱" 섹션의 웹 앱에서 이 형태의 config 객체를 복사할 수 있습니다.
    ========================================================================= */
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
-
-// Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
 const firebaseConfig = {
   apiKey: "AIzaSyBxlAWmJLvutf6_xyJ-zA3T1FutMAIVEDo",
   authDomain: "vernon-smith-stock-trade.firebaseapp.com",
-  projectId: "vernon-smith-stock-trade",
-  storageBucket: "vernon-smith-stock-trade.firebasestorage.app",
-  messagingSenderId: "712391056279",
-  appId: "1:712391056279:web:fc43df8c8be0063eae02d2",
-  measurementId: "G-69FFQ5M8TX"
+  databaseURL: "https://vernon-smith-stock-trade-default-rtdb.firebaseio.com",
+  projectId: "vernon-smith-stock-trade"
 };
-
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
 /* ========================================================================= */
 
 const NEEDS_SETUP = firebaseConfig.apiKey === "YOUR_API_KEY";
