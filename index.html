@@ -138,10 +138,10 @@ async function getJSON(path, fallback){
   }catch(e){ console.error('read failed', path, e); return fallback; }
 }
 async function setJSON(path, val){
-  try{ await db.ref(path).set(val); return true; }catch(e){ console.error('write failed', path, e); return false; }
+  try{ await withTimeout(db.ref(path).set(val), 7000); return true; }catch(e){ console.error('write failed', path, e); return false; }
 }
 async function updatePaths(obj){
-  try{ await db.ref().update(obj); return true; }catch(e){ console.error('update failed', obj, e); return false; }
+  try{ await withTimeout(db.ref().update(obj), 7000); return true; }catch(e){ console.error('update failed', obj, e); return false; }
 }
 
 function sanitizeName(raw){
@@ -196,9 +196,10 @@ async function loadAll(){
   S.round = round;
   S.history = Object.values(historyObj || {}).sort((a,b)=>a.round-b.round);
 
+  const participantsObj = await getJSON('participants', {});
+  S.participantNames = Object.keys(participantsObj || {});
+
   if(S.role === 'host'){
-    const participantsObj = await getJSON('participants', {});
-    S.participantNames = Object.keys(participantsObj || {});
     if(round && round.status === 'collecting'){
       const ordersObj = await getJSON(`orders/${round.round}`, {});
       S.orderCount = Object.keys(ordersObj || {}).length;
@@ -223,12 +224,12 @@ async function claimHost(){
   S.busy = true; render();
   let blocked = false;
   try{
-    await db.ref('config').transaction((current)=>{
+    await withTimeout(db.ref('config').transaction((current)=>{
       if(current && current.hostClaimed){ blocked = true; return; }
       const base = current || defaultConfig();
       base.hostClaimed = true;
       return base;
-    });
+    }), 7000);
   }catch(e){ console.error(e); }
   if(blocked){
     S.hostBlockedMsg = '이미 다른 진행자가 접속해 있습니다.';
@@ -239,6 +240,19 @@ async function claimHost(){
   S.role = 'host';
   S.editRounds = config.totalRounds;
   S.editDividends = config.dividendValues.slice();
+  S.busy = false;
+  await loadAll();
+}
+
+async function forceHost(){
+  S.busy = true; render();
+  const config = await getJSON('config', defaultConfig());
+  config.hostClaimed = true;
+  await setJSON('config', config);
+  S.hostBlockedMsg = '';
+  S.role = 'host';
+  S.editRounds = config.totalRounds;
+  S.editDividends = (config.dividendValues || DEFAULT_DIVIDENDS).slice();
   S.busy = false;
   await loadAll();
 }
@@ -571,7 +585,12 @@ function renderRoleSelect(){
         </div>
       </div>
     </div>
-    ${S.hostBlockedMsg ? `<div class="panel panel-tight" style="border-color:var(--danger); color:var(--danger); margin-top:14px;">${S.hostBlockedMsg}</div>` : ''}
+    ${S.hostBlockedMsg ? `
+      <div class="panel panel-tight" style="border-color:var(--danger); margin-top:14px;">
+        <p style="color:var(--danger); font-size:14px; margin:0 0 10px;">${S.hostBlockedMsg}</p>
+        <p class="small" style="margin-bottom:10px;">이전에 진행자로 접속했던 기록이 남아있는 경우입니다. 본인이 진행자라면 아래 버튼으로 이어서 입장하세요.</p>
+        <button class="warn" id="forceHostBtn">진행자로 이어서 입장 (기존 세션 인수)</button>
+      </div>` : ''}
   `;
 }
 function attachRoleEvents(){
@@ -585,6 +604,8 @@ function attachRoleEvents(){
   if(nameField) nameField.oninput = (e)=>{ S.nameInput = e.target.value; };
   if(nameField) nameField.onkeydown = (e)=>{ if(e.key==='Enter') joinAsParticipant(); };
   if(joinBtn) joinBtn.onclick = joinAsParticipant;
+  const forceHostBtn = document.getElementById('forceHostBtn');
+  if(forceHostBtn) forceHostBtn.onclick = forceHost;
 }
 
 function statusBadge(){
@@ -626,6 +647,18 @@ function renderHistoryTable(){
     </table>
   `;
 }
+function renderParticipantsPanel(){
+  return `
+    <div class="panel panel-tight">
+      <div class="row between">
+        <h3 style="font-size:14px;">접속한 참가자 <span class="mono tag-bid">${S.participantNames.length}명</span></h3>
+      </div>
+      ${S.participantNames.length
+        ? `<div class="row" style="margin-top:8px;">${S.participantNames.map(n=>`<span class="badge">${n}${n===S.safeName?' (나)':''}</span>`).join('')}</div>`
+        : `<p class="small" style="margin-top:6px;">아직 없음 — 새로고침으로 갱신됩니다.</p>`}
+    </div>
+  `;
+}
 function renderChartBlock(){
   return `<div class="panel"><h3 style="font-size:15px; margin-bottom:12px;">펀더멘털 가치 vs 체결가</h3><canvas id="priceChart" height="160"></canvas></div>`;
 }
@@ -659,10 +692,7 @@ function renderHost(){
         <button class="primary" id="startBtn" ${S.participantNames.length===0?'disabled':''}>세션 시작</button>
         ${S.participantNames.length===0 ? `<p class="small" style="margin-top:8px;">참가자가 최소 1명 접속해야 시작할 수 있습니다.</p>` : ''}
       </div>
-      <div class="panel">
-        <h3 style="font-size:15px; margin-bottom:8px;">접속한 참가자</h3>
-        ${S.participantNames.length ? `<div class="row">${S.participantNames.map(n=>`<span class="badge">${n}</span>`).join('')}</div>` : `<p class="small">아직 없음</p>`}
-      </div>
+      ${renderParticipantsPanel()}
     `;
   } else if(c.status === 'active' && r){
     let controls = '';
@@ -794,6 +824,7 @@ function renderParticipant(){
     <div class="eyebrow">participant · ${S.name}</div>
     <h1 style="font-size:22px; margin-bottom:10px;">거래 화면</h1>
     ${renderTicker()}
+    ${renderParticipantsPanel()}
     ${body}
   `;
 }
