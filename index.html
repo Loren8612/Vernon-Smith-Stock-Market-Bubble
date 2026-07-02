@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>자산시장 거래 실험실</title>
+<title>자산시장 실험실</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -84,13 +84,24 @@
 <div id="app"></div>
 
 <script>
+// 오류가 나면 검은 화면 대신 오류 내용을 화면에 표시 (진단용)
+window.onerror = function(msg, src, line, col, err){
+  var app = document.getElementById('app');
+  if(app && !app.innerHTML.trim()){
+    app.innerHTML = '<div style="border:1px solid #E2745C; border-radius:10px; padding:16px; color:#E2745C; font-family:monospace; font-size:13px; word-break:break-all;">'
+      + '<strong>스크립트 오류가 발생했습니다</strong><br><br>'
+      + String(msg) + '<br>줄: ' + line + ':' + col
+      + '<br><br>이 화면을 캡처해서 공유해주세요.</div>';
+  }
+};
+</script>
+<script>
 /* =========================================================================
    1) 여기에 본인의 Firebase 프로젝트 설정값을 붙여넣으세요.
    Firebase 콘솔(console.firebase.google.com) → 프로젝트 설정 → 일반 →
    "내 앱" 섹션의 웹 앱에서 이 형태의 config 객체를 복사할 수 있습니다.
    ========================================================================= */
-const firebaseConfig = {
-  // Import the functions you need from the SDKs you need
+// Import the functions you need from the SDKs you need
 import { initializeApp } from "firebase/app";
 import { getAnalytics } from "firebase/analytics";
 // TODO: Add SDKs for Firebase products that you want to use
@@ -111,7 +122,6 @@ const firebaseConfig = {
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const analytics = getAnalytics(app);
-};
 /* ========================================================================= */
 
 const NEEDS_SETUP = firebaseConfig.apiKey === "YOUR_API_KEY";
