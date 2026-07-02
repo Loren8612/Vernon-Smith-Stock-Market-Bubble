@@ -260,8 +260,14 @@ async function forceHost(){
 async function joinAsParticipant(){
   const safe = sanitizeName(S.nameInput);
   if(!safe) return;
-  S.busy = true; render();
-  await setJSON(`participants/${safe}`, {joinedAt: Date.now()});
+  S.busy = true; S.joinError = ''; render();
+  const ok = await setJSON(`participants/${safe}`, {joinedAt: Date.now()});
+  if(!ok){
+    S.busy = false;
+    S.joinError = '서버에 저장하지 못했습니다. Firebase 규칙이 쓰기를 허용하는지(테스트 모드) 확인하세요.';
+    render();
+    return;
+  }
   S.role = 'participant'; S.name = S.nameInput.trim(); S.safeName = safe;
   S.busy = false;
   await loadAll();
@@ -502,7 +508,9 @@ function renderGate(){
   if(S.dbStatus === 'checking'){
     statusLine = `<p class="small" style="margin-top:10px;">서버 연결 확인 중…</p>`;
   } else if(S.dbStatus === 'ok'){
-    statusLine = `<p class="small" style="margin-top:10px; color:var(--bid);">✓ 서버 연결됨</p>`;
+    statusLine = `<p class="small" style="margin-top:10px; color:var(--bid);">✓ 서버 연결됨 (읽기·쓰기 정상)</p>`;
+  } else if(S.dbStatus === 'readonly'){
+    statusLine = `<p class="small" style="margin-top:10px; color:var(--danger);">⚠ 읽기는 되지만 쓰기가 거부됩니다. Firebase 콘솔 → Realtime Database → 규칙에서 ".write": true 인지 확인하세요 (테스트 모드 기간 만료 여부 포함).</p>`;
   } else {
     statusLine = `<p class="small" style="margin-top:10px; color:var(--danger);">✗ 데이터베이스에 연결할 수 없습니다. 파일 상단 firebaseConfig의 databaseURL이 Firebase 콘솔 → Realtime Database 화면에 표시된 실제 주소와 같은지 확인하세요.</p>`;
   }
@@ -563,7 +571,8 @@ function renderRoleSelect(){
     <h2 class="sr-only">자산시장 버블 실험실 진입 화면</h2>
     <div class="eyebrow">asset bubble lab</div>
     <h1 style="font-size:26px; margin-bottom:6px;">자산시장 버블 실험실</h1>
-    <p class="muted" style="margin-bottom:22px;">콜마켓 방식으로 진행되는 실시간 자산가격 실험 도구입니다.</p>
+    <p class="muted" style="margin-bottom:8px;">콜마켓 방식으로 진행되는 실시간 자산가격 실험 도구입니다.</p>
+    <div style="margin-bottom:16px;">${dbChip()}</div>
     <div class="role-choice">
       <div class="role-card" id="hostCard">
         <div class="eyebrow" style="margin-bottom:8px;">1인</div>
@@ -576,13 +585,14 @@ function renderRoleSelect(){
         <p class="muted" style="font-size:13px; margin-top:6px;">매 라운드 매수·매도 희망가를 제출합니다.</p>
       </div>
     </div>
-    <div id="joinForm" style="display:none; margin-top:16px;">
+    <div id="joinForm" style="display:${S.showJoinForm?'block':'none'}; margin-top:16px;">
       <div class="panel panel-tight">
         <label for="nameField">참가자 이름</label>
         <div class="row">
-          <div style="flex:1;"><input id="nameField" type="text" placeholder="예: 지민" maxlength="24" /></div>
-          <button class="primary" id="joinBtn">입장하기</button>
+          <div style="flex:1;"><input id="nameField" type="text" placeholder="예: 지민" maxlength="24" value="${(S.nameInput||'').replace(/"/g,'&quot;')}" /></div>
+          <button class="primary" id="joinBtn" ${S.busy?'disabled':''}>${S.busy?'입장 중…':'입장하기'}</button>
         </div>
+        ${S.joinError ? `<p class="small" style="color:var(--danger); margin-top:8px;">${S.joinError}</p>` : ''}
       </div>
     </div>
     ${S.hostBlockedMsg ? `
@@ -598,7 +608,7 @@ function attachRoleEvents(){
   const partCard = document.getElementById('participantCard');
   const joinForm = document.getElementById('joinForm');
   if(hostCard) hostCard.onclick = claimHost;
-  if(partCard) partCard.onclick = ()=>{ joinForm.style.display='block'; document.getElementById('nameField').focus(); };
+  if(partCard) partCard.onclick = ()=>{ S.showJoinForm = true; render(); const nf = document.getElementById('nameField'); if(nf) nf.focus(); };
   const nameField = document.getElementById('nameField');
   const joinBtn = document.getElementById('joinBtn');
   if(nameField) nameField.oninput = (e)=>{ S.nameInput = e.target.value; };
@@ -613,12 +623,18 @@ function statusBadge(){
   const label = st==='lobby' ? '대기 중' : st==='active' ? '진행 중' : '종료됨';
   return `<span class="badge"><span class="dot ${st==='active'?'live':''}"></span>${label}</span>`;
 }
+function dbChip(){
+  if(S.dbStatus === 'ok') return `<span class="badge" style="color:var(--bid);">DB ✓</span>`;
+  if(S.dbStatus === 'readonly') return `<span class="badge" style="color:var(--danger);">DB 쓰기거부</span>`;
+  if(S.dbStatus === 'error') return `<span class="badge" style="color:var(--danger);">DB 연결안됨</span>`;
+  return `<span class="badge">DB 확인중</span>`;
+}
 function renderTicker(){
   const c = S.config; const r = S.round;
   const updated = S.lastUpdated ? S.lastUpdated.toLocaleTimeString('ko-KR') : '아직 없음';
   return `
     <div class="ticker">
-      <div class="status-line">${statusBadge()}<span class="mono">${c && c.status!=='lobby' ? `라운드 ${r?r.round:c.currentRound} / ${c.totalRounds}` : '세션 준비 중'}</span></div>
+      <div class="status-line">${statusBadge()}${dbChip()}<span class="mono">${c && c.status!=='lobby' ? `라운드 ${r?r.round:c.currentRound} / ${c.totalRounds}` : '세션 준비 중'}</span></div>
       <div class="status-line mono">${r ? `펀더멘털 가치 <span class="tag-fund">${fmt(r.fundamentalValue)}</span>` : ''}</div>
       <div class="row" style="gap:10px;">
         <span class="small mono">확인 시각 ${updated}</span>
@@ -794,8 +810,8 @@ function renderParticipant(){
             <h3 style="font-size:16px; margin-bottom:4px;">이번 라운드 희망가 제출</h3>
             <p class="small" style="margin-bottom:14px;">둘 다 채우지 않아도 됩니다. 사고 싶으면 매수가만, 팔고 싶으면 매도가만 입력하세요.</p>
             <div class="grid2">
-              <div><label for="bidField" class="tag-bid">매수 희망가 (사고 싶은 가격)</label><input id="bidField" class="mono" type="number" min="0" placeholder="예: 22" /></div>
-              <div><label for="askField" class="tag-ask">매도 희망가 (팔고 싶은 가격)</label><input id="askField" class="mono" type="number" min="0" placeholder="예: 26" /></div>
+              <div><label for="bidField" class="tag-bid">매수 희망가 (사고 싶은 가격)</label><input id="bidField" class="mono" type="number" min="0" placeholder="예: 22" value="${S.bidInput!==''?S.bidInput:''}" /></div>
+              <div><label for="askField" class="tag-ask">매도 희망가 (팔고 싶은 가격)</label><input id="askField" class="mono" type="number" min="0" placeholder="예: 26" value="${S.askInput!==''?S.askInput:''}" /></div>
             </div>
             <button class="primary" id="submitBtn" style="margin-top:14px;" ${S.busy?'disabled':''}>제출하기</button>
           </div>`;
@@ -846,16 +862,19 @@ async function init(){
     if(sessionStorage.getItem('bubblelab_gate') === 'ok') S.gateOk = true;
   }catch(e){}
   render();
-  // 2) 배경에서 서버 연결 확인 + 서버에 저장된 초대 코드 반영 (7초 제한)
+  // 2) 배경에서 읽기/쓰기 상태를 각각 확인 (7초 제한)
   if(!db){ S.dbStatus = 'error'; render(); return; }
+  let readOk = false, writeOk = false;
   try{
     const snap = await withTimeout(db.ref('settings/inviteCode').get(), 7000);
-    S.dbStatus = 'ok';
+    readOk = true;
     if(snap.exists()) S.inviteCode = snap.val();
-  }catch(e){
-    console.error('DB 연결 확인 실패', e);
-    S.dbStatus = 'error';
-  }
+  }catch(e){ console.error('DB 읽기 실패', e); }
+  try{
+    await withTimeout(db.ref('health/lastPing').set(Date.now()), 7000);
+    writeOk = true;
+  }catch(e){ console.error('DB 쓰기 실패', e); }
+  S.dbStatus = (readOk && writeOk) ? 'ok' : (readOk ? 'readonly' : 'error');
   render();
 }
 init();
